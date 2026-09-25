@@ -1,0 +1,83 @@
+name: SAST + secret scan
+
+# Self-scan of this repo's own source with pentest-agent's SAST phase
+# (semgrep + gitleaks) on every push to main and every pull request.
+# Report-only: findings are published to the Security tab and as a
+# downloadable artifact, but never fail the job -- only a genuine tool
+# crash does. See pentest-agent/README.md's "CI: SAST + secret scanning".
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  # Needed to upload SARIF to the repo's Security > Code scanning tab. On a
+  # pull_request from a fork, GITHUB_TOKEN is read-only regardless of this
+  # setting, so the SARIF upload step below is best-effort (`continue-on-error`)
+  # for that case; the downloadable artifact still has the full report.
+  security-events: write
+
+jobs:
+  sast:
+    name: semgrep + gitleaks (self-scan)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pentest-agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pentest-agent
+        run: pip install -e .
+
+      - name: Install semgrep
+        run: pip install semgrep
+
+      - name: Install gitleaks
+        # Pinned to the same version the sandbox Docker image uses
+        # (docker/Dockerfile) for consistent results between local/docker/CI.
+        run: |
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Run SAST + secret scan
+        env:
+          PA_EXECUTOR: local
+          PA_OUTPUT_DIR: ./out
+          # Optional: set an ANTHROPIC_API_KEY repo/org secret for an
+          # LLM-written executive summary in the report. Safe to leave unset
+          # -- report_node falls back to a factual-only report without one.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: pentest-agent run --scope scopes/ci-self-scan.yaml --auto-approve
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        continue-on-error: true # e.g. fork PRs without security-events: write
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: pentest-agent/out/CI-SELF-SCAN/report.sarif
+          category: pentest-agent-sast
+
+      - name: Upload full report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-report
+          path: |
+            pentest-agent/out/CI-SELF-SCAN/report.html
+            pentest-agent/out/CI-SELF-SCAN/findings.json
+            pentest-agent/out/CI-SELF-SCAN/report.sarif
+            pentest-agent/out/CI-SELF-SCAN/audit.jsonl
+          retention-days: 30
+          if-no-files-found: warn
